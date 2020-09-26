@@ -350,18 +350,18 @@ function dynamics(b::Basis)
 end
 
 function _generate_deqs(b, states, iv, p)
-    @assert length(b) == length(states)
+    #@assert length(b) == length(states)
     # Define the time
     @derivatives D'~iv
 
-    vs = similar(states)
-    dvs = similar(states)
+    D.(states) .~ b(states, p, iv)
+end
 
-    for (i, vi) in enumerate(states)
-        vs[i] = ModelingToolkit.Operation(vi.op, [iv])
-        dvs[i] = D(vs[i])
-    end
-    eqs = dvs .~ b(vs, p, iv) 
+function _generate_deqs(b, states, iv, p, controls)
+    println("Blubb")
+    @derivatives D'~iv
+    D.(states) .~ b(vcat(states, controls), p, iv)
+
 end
 
 
@@ -371,6 +371,7 @@ end
     Converts the `Basis` into an `ODESystem` defined via `ModelingToolkit.jl`.
 """
 function ModelingToolkit.ODESystem(b::Basis, iv = independent_variable(b), states = variables(b), p = parameters(b); kwargs...)
+    return iv
     eqs = _generate_deqs(b, states, iv, p)
     return ODESystem(eqs, iv, states, p; kwargs...)
 end
@@ -378,6 +379,6 @@ end
 """
 """
 function ModelingToolkit.ControlSystem(loss::Operation, b::Basis,  iv = independent_variable(b), states = variables(b), controls = Operation[], p = parameters(b); kwargs...)
-    eqs = _generate_deqs(b, iv, vcat(states, controls), p)
+    eqs = DataDrivenDiffEq._generate_deqs(b, states, iv, p, controls)
     return ControlSystem(loss, eqs, iv, states, controls, p; kwargs...)
 end
