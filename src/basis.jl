@@ -349,23 +349,35 @@ function dynamics(b::Basis)
     return b.f_
 end
 
+function _generate_deqs(b, states, iv, p)
+    @assert length(b) == length(states)
+    # Define the time
+    @derivatives D'~iv
+
+    vs = similar(states)
+    dvs = similar(states)
+
+    for (i, vi) in enumerate(states)
+        vs[i] = ModelingToolkit.Operation(vi.op, [iv])
+        dvs[i] = D(vs[i])
+    end
+    eqs = dvs .~ b(vs, p, iv) 
+end
+
+
 """
     ODESystem(basis)
 
     Converts the `Basis` into an `ODESystem` defined via `ModelingToolkit.jl`.
 """
-function ModelingToolkit.ODESystem(b::Basis)
-    @assert length(b) == length(variables(b))
-    # Define the time
-    @derivatives D'~independent_variable(b)
+function ModelingToolkit.ODESystem(b::Basis, iv = independent_variable(b), states = variables(b), p = parameters(b); kwargs...)
+    eqs = _generate_deqs(b, states, iv, p)
+    return ODESystem(eqs, iv, states, p; kwargs...)
+end
 
-    vs = similar(b.variables)
-    dvs = similar(b.variables)
-
-    for (i, vi) in enumerate(b.variables)
-        vs[i] = ModelingToolkit.Operation(vi.op, [independent_variable(b)])
-        dvs[i] = D(vs[i])
-    end
-    eqs = dvs .~ b(vs, parameters(b), independent_variable(b))
-    return ODESystem(eqs, independent_variable(b), variables(b), parameters(b))
+"""
+"""
+function ModelingToolkit.ControlSystem(loss::Operation, b::Basis,  iv = independent_variable(b), states = variables(b), controls = Operation[], p = parameters(b); kwargs...)
+    eqs = _generate_deqs(b, iv, vcat(states, controls), p)
+    return ControlSystem(loss, eqs, iv, states, controls, p; kwargs...)
 end

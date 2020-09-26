@@ -150,6 +150,6 @@ Return the coefficient matrix `Ξ` of the `SparseIdentificationResult`.
 """
 get_coefficients(r::SparseIdentificationResult) = r.coeff
 
-function ModelingToolkit.ODESystem(b::SparseIdentificationResult)
-    return ODESystem(b.equations)
+function ModelingToolkit.ODESystem(b::SparseIdentificationResult, args...; kwargs...)
+    return ODESystem(b.equations, args...; kwargs...)
 end
