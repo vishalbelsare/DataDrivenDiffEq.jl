@@ -350,7 +350,7 @@ function dynamics(b::Basis)
 end
 
 function _generate_deqs(b, states, iv, p)
-    #@assert length(b) == length(states)
+    @assert length(b) == length(states)
     # Define the time
     @derivatives D'~iv
 
@@ -358,7 +358,6 @@ function _generate_deqs(b, states, iv, p)
 end
 
 function _generate_deqs(b, states, iv, p, controls)
-    println("Blubb")
     @derivatives D'~iv
     D.(states) .~ b(vcat(states, controls), p, iv)
 
@@ -371,7 +370,6 @@ end
     Converts the `Basis` into an `ODESystem` defined via `ModelingToolkit.jl`.
 """
 function ModelingToolkit.ODESystem(b::Basis, iv = independent_variable(b), states = variables(b), p = parameters(b); kwargs...)
-    return iv
     eqs = _generate_deqs(b, states, iv, p)
     return ODESystem(eqs, iv, states, p; kwargs...)
 end
