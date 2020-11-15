@@ -77,11 +77,13 @@ f(u, p, t) = [u[3]; u[2]*u[1]; sin(u[1])*u[2]]
 b = Basis(f, u)
 
 using Flux
-NNlib.σ(x::Operation) = 1 / (1+exp(-x))
+NNlib.σ(x::Sym) = 1.0/(1.0+exp(-x))
 # Build a fully
 c = Chain(Dense(3,5,σ), Dense(5, 2, σ))
 ps, re = Flux.destructure(c)
-@parameters p[1:length(ps)]
-g(u, p, t) = re(p)(u)
-b = Basis(g, u, parameters = p)
+@parameters p[1:3]
+(u, p, t) = (p .* u).^2 .* exp(-t)
+typeof(tee)
+b = Basis(tee, u, p, t)
+b = Basis(u.^2, u)
 println(b)
