@@ -3,11 +3,15 @@ module DataDrivenDiffEq
 using LinearAlgebra
 using DiffEqBase
 using ModelingToolkit
+using ModelingToolkit: Term, Sym, FnType, value, <ₑ, isparameter
+using RuntimeGeneratedFunctions
 using QuadGK
 using Statistics
 using DSP
 using FiniteDifferences, DataInterpolations
 using Compat
+
+ModelingToolkit.RuntimeGeneratedFunctions.init(@__MODULE__)
 
 abstract type AbstractBasis end;
 abstract type AbstractKoopmanOperator end;
