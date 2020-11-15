@@ -29,8 +29,8 @@ Base.show(io::IO, x::Basis) = print(io, "$(length(x.basis)) dimensional basis in
     end
 end
 
-is_independent(o::Operation) = isempty(o.args)
-
+is_independent(o::Term) = isempty(o.args)
+is_independent(sym::Sym) = true
 
 
 """
@@ -67,8 +67,12 @@ same world-age evaluation. However, this can cause Julia to segfault
 on sufficiently large basis functions. By default eval_expression=false.
 
 """
-function Basis(basis::AbstractArray{Operation}, variables::AbstractArray{Operation};
-               parameters::AbstractArray =  Operation[], iv = nothing, linear_independent::Bool = false, simplify_eqs = true, eval_expression = false)
+function Basis(basis::AbstractVector, variables::AbstractVector;
+               parameters::AbstractArray =  [], iv = nothing, linear_independent::Bool = false, simplify_eqs = true, eval_expression = false)
+               
+    basis = Any[value.(basis)...]
+    variables = value.(variables)
+    
     @assert all(is_independent.(variables)) "Please provide independent states."
 
     bs = deepcopy(basis)
@@ -81,23 +85,22 @@ function Basis(basis::AbstractArray{Operation}, variables::AbstractArray{Operati
         iv = t
     end
 
-    vs = [ModelingToolkit.Variable(Symbol(i)) for i in variables]
-    ps = [ModelingToolkit.Variable(Symbol(i)) for i in parameters]
-
+    vs, ps = get_vars_params(bs)
+    
     if eval_expression
-        f_oop, f_iip = eval.(ModelingToolkit.build_function(bs, vs, ps, [iv], expression = Val{true}))
+        f_oop, f_iip = eval.(ModelingToolkit.build_function(bs, vs, ps, [iv], conv=toexpr∘simplify))
     else
-        f_oop, f_iip = ModelingToolkit.build_function(bs, vs, ps, [iv], expression = Val{false})
+        f_oop, f_iip = ModelingToolkit.build_function(bs, vs, ps, [iv], conv=toexpr∘simplify)
     end
 
     f_(u, p, t) = f_oop(u, p, t)
     f_(du, u, p, t) = f_iip(du, u, p, t)
 
-    return Basis(bs, variables, parameters, iv, f_)
+    return Basis(bs, variables, parameters, iv, @RuntimeGeneratedFunction(f_))
 end
 
 
-function Basis(basis::Function, variables::AbstractArray{Operation};  parameters::AbstractArray =  Operation[], iv = nothing, kwargs...)
+function Basis(basis::Function, variables::AbstractVector;  parameters::AbstractArray =  [], iv = nothing, kwargs...)
     @assert all(is_independent.(variables)) "Please provide independent variables for basis."
 
     if isnothing(iv)
@@ -113,11 +116,17 @@ function Basis(basis::Function, variables::AbstractArray{Operation};  parameters
     end
 end
 
+function get_vars_params(basis)
+    vss = collect(ModelingToolkit.vars(basis))
+    vs = filter(!isparameter, vss)
+    ps = filter(isparameter, vss)
+    sort!(vs, lt = <ₑ), sort!(ps, lt = <ₑ)
+end
+
 
 function update!(basis::Basis,eval_expression = false)
 
-    vs = [ModelingToolkit.Variable(Symbol(i))(basis.iv) for i in variables(basis)]
-    ps = [ModelingToolkit.Variable(Symbol(i)) for i in parameters(basis)]
+    vs, ps = get_vars_params(b.basis)
 
     if eval_expression
         f_oop, f_iip = eval.(ModelingToolkit.build_function(basis.basis, vs, ps, [basis.iv], expression = Val{false}))
@@ -128,7 +137,7 @@ function update!(basis::Basis,eval_expression = false)
     f_(u, p, t) = f_oop(u, p, t)
     f_(du, u, p, t) = f_iip(du, u, p, t)
 
-    basis.f_ = f_
+    b.f_ = ModelingToolkit.@RuntimeGeneratedFunction(f_)
     return
 end
 
@@ -139,7 +148,7 @@ end
     Push the operation(s) in `op` into the basis and update all internal fields accordingly.
     `op` can either be a single `Operation` or an Array of `Operation`s.
 """
-function Base.push!(b::Basis, ops::AbstractArray{Operation})
+function Base.push!(b::Basis, ops::AbstractVector)
     @inbounds for o in ops
         push!(b.basis, o)
     end
@@ -148,9 +157,8 @@ function Base.push!(b::Basis, ops::AbstractArray{Operation})
     return
 end
 
-function Base.push!(b::Basis, op₀::Operation)
-    op = simplify(op₀)
-    push!(b.basis, op)
+function Base.push!(b::Basis, op)
+    push!(b.basis, value(op))
     # Check for uniqueness
     unique!(b)
     update!(b)
@@ -214,9 +222,9 @@ function is_unary(f::Function)
     return true
 end
 
-function count_operation(x::T, op::Function, nested::Bool = true) where T <: Expression
+function count_operation(x::T, op::Function, nested::Bool = true) where T <: Sym
     isa(x, ModelingToolkit.Constant) && return 0
-    isa(x.op, Expression) && return 0
+    isa(x.op, Sym) && return 0
     if x.op == op
         if is_unary(op)
             # Handles sin, cos and stuff
@@ -233,7 +241,7 @@ function count_operation(x::T, op::Function, nested::Bool = true) where T <: Exp
     return 0
 end
 
-function count_operation(x::T, ops::AbstractArray,nested::Bool = true) where T<:Expression
+function count_operation(x::T, ops::AbstractArray,nested::Bool = true) where T<:Sym
     c_ops = 0
     for oi in ops
         c_ops += count_operation(x, oi, nested)
@@ -241,7 +249,7 @@ function count_operation(x::T, ops::AbstractArray,nested::Bool = true) where T<:
     return c_ops
 end
 
-function count_operation(x::AbstractVector{T}, op, nested::Bool = true) where T <: Expression
+function count_operation(x::AbstractVector{T}, op, nested::Bool = true) where T <: Sym
     c_ops = 0
     for xi in x
         c_ops += count_operation(xi, op, nested)
@@ -249,22 +257,22 @@ function count_operation(x::AbstractVector{T}, op, nested::Bool = true) where T 
     return c_ops
 end
 
-function remove_constant_factor(o::T) where T <: Expression
+function remove_constant_factor(o::T) where T <: Sym
     isa(o, ModelingToolkit.Constant) && return ModelingToolkit.Constant(1)
     n_ops = count_operation(o, *, false) +1
-    ops = Array{Expression}(undef, n_ops)
+    ops = Array{Sym}(undef, n_ops)
     @views split_operation!(ops, o, [*])
     filter!(x->!isa(x, ModelingToolkit.Constant), ops)
     return prod(ops)
 end
 
-function remove_constant_factor!(o::AbstractArray{T}) where T <: Expression
+function remove_constant_factor!(o::AbstractArray{T}) where T <: Sym
     for i in eachindex(o)
         o[i] = remove_constant_factor(o[i])
     end
 end
 
-function split_operation!(k::AbstractVector{T}, o::Expression, ops::AbstractArray = [+]) where T <: Expression
+function split_operation!(k::AbstractVector{T}, o::Sym, ops::AbstractArray = [+]) where T <: Sym
     n_ops = count_operation(o, ops, false) 
     c_ops = 0
     @views begin
@@ -281,7 +289,7 @@ function split_operation!(k::AbstractVector{T}, o::Expression, ops::AbstractArra
     end
 end
 
-function create_linear_independent_eqs(o::AbstractVector{T}) where T <: Expression
+function create_linear_independent_eqs(o::AbstractVector{T}) where T <: Sym
     unique!(o)
     n_ops = [count_operation(bi, +, false) for bi in o]
     n_x = sum(n_ops) + length(o)
@@ -307,7 +315,7 @@ free_parameters(b::Basis; operations = [+]) = count_operation(b.basis, operation
 function (b::Basis)(x::AbstractMatrix, p::AbstractArray = [], t::AbstractArray = [])
     isempty(t) ? nothing : @assert size(x, 2) == length(t)
 
-    if (isempty(p) || eltype(p) <: Expression) && !isempty(parameters(b))
+    if (isempty(p) || eltype(p) <: Sym) && !isempty(parameters(b))
         pi = isempty(p) ? parameters(b) : p
         res = zeros(eltype(pi), length(b), size(x)[2])
     else
@@ -404,7 +412,7 @@ function Base.unique(b::Basis)
     return Basis(b.basis[returns], variables(b), parameters = parameters(b))
 end
 
-function Base.unique(b₀::AbstractVector{Operation})
+function Base.unique(b₀::AbstractVector)
     b = simplify.(b₀)
     N = length(b)
     returns = Vector{Bool}()
@@ -415,7 +423,7 @@ function Base.unique(b₀::AbstractVector{Operation})
     return b[returns]
 end
 
-function Base.unique!(b::AbstractArray{Operation})
+function Base.unique!(b::AbstractVector)
     N = length(b)
     removes = Vector{Bool}()
     for i ∈ 1:N
@@ -433,6 +441,8 @@ function dynamics(b::Basis)
     return b.f_
 end
 
+make_sym_a_func(s::Sym, t) = Sym{FnType{Tuple, Real}}(nameof(s))(t)
+
 """
     ODESystem(basis)
 
@@ -447,7 +457,7 @@ function ModelingToolkit.ODESystem(b::Basis)
     dvs = similar(b.variables)
 
     for (i, vi) in enumerate(b.variables)
-        vs[i] = ModelingToolkit.Operation(vi.op, [independent_variable(b)])
+        vs[i] = make_sym_a_func(vi, independent_variable(b))
         dvs[i] = D(vs[i])
     end
     eqs = dvs .~ b(vs, parameters(b), independent_variable(b))
