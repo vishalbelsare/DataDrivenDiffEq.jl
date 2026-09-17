@@ -3,30 +3,23 @@ on:
   pull_request:
     branches:
       - master
+    paths-ignore:
+      - 'docs/**'
   push:
     branches:
       - master
+    paths-ignore:
+      - 'docs/**'
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_name != github.event.repository.default_branch || github.ref != 'refs/tags/v*' }}
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-      - uses: julia-actions/setup-julia@v1
-        with:
-          version: 1
-      - uses: actions/cache@v1
-        env:
-          cache-name: cache-artifacts
-        with:
-          path: ~/.julia/artifacts
-          key: ${{ runner.os }}-test-${{ env.cache-name }}-${{ hashFiles('**/Project.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-test-${{ env.cache-name }}-
-            ${{ runner.os }}-test-
-            ${{ runner.os }}-
-      - uses: julia-actions/julia-buildpkg@v1
-      - uses: julia-actions/julia-runtest@v1
-      - uses: julia-actions/julia-processcoverage@v1
-      - uses: codecov/codecov-action@v1
-        with:
-          file: lcov.info
+  tests:
+    # Root-only test groups (Core, QA) are declared in test/test_groups.toml.
+    # The lib/* sublibraries (DataDrivenDMD, DataDrivenSR, DataDrivenSparse,
+    # DataDrivenLux) are covered by SublibraryCI.yml via the project model and
+    # must not be double-tested through this root matrix.
+    uses: "SciML/.github/.github/workflows/grouped-tests.yml@v1"
+    with:
+      coverage-directories: "src"
+    secrets: "inherit"

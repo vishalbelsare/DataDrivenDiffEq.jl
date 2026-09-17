@@ -1,43 +1,115 @@
-push!(LOAD_PATH,"../src/")
+#push!(LOAD_PATH,"../src/")
 
-using Documenter, DataDrivenDiffEq
-using Flux, SymbolicRegression
+# Add the sublibs
+using Pkg
+
+function dev_subpkg(subpkg)
+    subpkg_path = abspath(joinpath(dirname(@__FILE__), "..", "lib", subpkg))
+    return Pkg.develop(PackageSpec(path = subpkg_path))
+end
+
+Pkg.develop(PackageSpec(path = abspath(joinpath(dirname(@__FILE__), ".."))))
+
+dev_subpkg("DataDrivenDMD")
+dev_subpkg("DataDrivenLux")
+dev_subpkg("DataDrivenSparse")
+dev_subpkg("DataDrivenSR")
+
+using Documenter
+using DataDrivenDiffEq
+using DataDrivenDMD
+using DataDrivenLux
+using DataDrivenSparse
+using DataDrivenSR
+
+import StatsAPI
+import StatsBase
+using StatsBase: summarystats
+using Literate
+
+cp(joinpath(@__DIR__, "Manifest.toml"), joinpath(@__DIR__, "src", "assets", "Manifest.toml"), force = true)
+cp(joinpath(@__DIR__, "Project.toml"), joinpath(@__DIR__, "src", "assets", "Project.toml"), force = true)
 
 ENV["GKSwstype"] = "100"
 
+# Evaluate the example directory
+src = joinpath(@__DIR__, "src")
+
+function create_tutorials(dirname, targetdir, excludes = [])
+    tutorials = []
+
+    if isdir(targetdir)
+        rm(targetdir, recursive = true)
+    else
+        mkdir(targetdir)
+    end
+
+    foreach(walkdir(dirname)) do (root, _, files)
+        for file in files
+            file ∈ excludes && continue
+            fname, fext = splitext(file)
+            fext == ".jl" || continue
+            ipath = joinpath(root, file)
+            script = Literate.script(ipath, targetdir, execute = false, comments = false)
+            @info script
+            code = strip(read(script, String))
+            mdpost(str) = replace(str, "@__CODE__" => code)
+            Literate.markdown(ipath, targetdir)
+            Literate.markdown(ipath, targetdir, execute = false, postprocess = mdpost)
+            push!(
+                tutorials,
+                relpath(joinpath(targetdir, fname * ".md"), joinpath(@__DIR__, "src"))
+            )
+        end
+    end
+    return tutorials
+end
+
+koopman_tutorial = create_tutorials(
+    joinpath(@__DIR__, "src/libs/datadrivendmd/"),
+    joinpath(@__DIR__, "src/libs/datadrivendmd/examples")
+)
+sparse_tutorial = create_tutorials(
+    joinpath(@__DIR__, "src/libs/datadrivensparse/"),
+    joinpath(@__DIR__, "src/libs/datadrivensparse/examples")
+)
+sr_tutorial = create_tutorials(
+    joinpath(@__DIR__, "src/libs/datadrivensr/"),
+    joinpath(@__DIR__, "src/libs/datadrivensr/examples")
+)
+
+# Must be after tutorials is created
+include("pages.jl")
+
+# Create the docs
 makedocs(
-    sitename="DataDrivenDiffEq.jl",
-    authors="Julius Martensen, Christopher Rackauckas",
-    modules=[DataDrivenDiffEq],
-    clean=true,doctest=false,
-    format = Documenter.HTML(#analytics = "UA-90474609-3",
-                             assets = ["assets/favicon.ico"],
-                             canonical="https://datadriven.sciml.ai/stable/"),
-    pages=[
-        "Home" => "index.md",
-        "Getting Started" => "getting_started.md",
-        "Tutorials" => Any[
-          "examples/linear_systems.md",
-          "examples/nonlinear_systems.md",
-          "examples/implicit_systems.md",
-          "examples/symbolic_regression.md"
-        ],
-        "Unifying SINDy and DMD" => "sindy_dmd.md",
-        "Problems" => "problems.md",
-        "Basis" => "basis.md",
-        "Solvers" => Any[
-          "solvers/koopman.md",
-          "solvers/optimization.md",
-          "solvers/symbolic_regression.md"
-        ],
-        "Solutions" => "solutions.md",
-        "Utilities" => "utils.md",
-        "Contributing" => "contributions.md",
-        "Citing" => "citations.md"
-        ]
+    sitename = "DataDrivenDiffEq.jl",
+    authors = "Julius Martensen, Christopher Rackauckas, et al.",
+    modules = [DataDrivenDiffEq, DataDrivenDMD, DataDrivenLux, DataDrivenSparse, DataDrivenSR],
+    clean = true, doctest = true, linkcheck = true,
+    linkcheck_ignore = [
+        "http://cwrowley.princeton.edu/papers/Hemati-2017a.pdf",
+        "https://royalsocietypublishing.org/doi/10.1098/rspa.2020.0279",
+        "https://www.pnas.org/doi/10.1073/pnas.1517384113",
+        "https://link.springer.com/article/10.1007/s00332-015-9258-5",
+        # SciML's hosted docs reject Documenter's linkcheck crawler with HTTP 403,
+        # though the cross-doc links resolve fine in a browser.
+        r"^https://docs\.sciml\.ai/.*",
+        # Zenodo's latestdoi redirect times out under Documenter's 10s curl budget
+        # (exit 28) even though the badge resolves in a browser.
+        "https://zenodo.org/badge/latestdoi/212827023",
+        # GitHub raw returns 404 to Documenter's crawler on Actions; the file is
+        # present (HEAD/GET 200 outside CI).
+        "https://raw.githubusercontent.com/eurika-kaiser/SINDY-MPC/e1dfd9908b2b56af303ee9fb30a133aced4fd757/utils/sparsifyDynamics.m",
+    ],
+    format = Documenter.HTML(
+        assets = ["assets/favicon.ico"],
+        canonical = "https://docs.sciml.ai/DataDrivenDiffEq/stable/"
+    ),
+    pages = pages
 )
 
 deploydocs(
-   repo = "github.com/SciML/DataDrivenDiffEq.jl.git";
-   push_preview = true
+    repo = "github.com/SciML/DataDrivenDiffEq.jl.git";
+    push_preview = true
 )

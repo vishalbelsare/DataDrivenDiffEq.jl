@@ -1,15 +1,25 @@
-for f in [:chebyshev_basis, :sin_basis, :cos_basis, :fourier_basis, :polynomial_basis, :monomial_basis]
-    @eval $f(x, c) = $f(scalarize(x), c)
+_basis_input(x::Number) = [x]
+_basis_input(x) = collect(x)
+
+for f in [
+        :chebyshev_basis,
+        :sin_basis,
+        :cos_basis,
+        :fourier_basis,
+        :polynomial_basis,
+        :monomial_basis,
+    ]
+    @eval $f(x, c) = $f(_basis_input(x), c)
 end
+
 function _generateBasis!(eqs, f, x, coeffs)
     n_x = size(x, 1)
-    @assert length(eqs) == size(x, 1)*length(coeffs)
+    @assert length(eqs) == size(x, 1) * length(coeffs)
     @inbounds for (i, ti) in enumerate(coeffs)
-        eqs[(i-1)*n_x+1:i*n_x] .= f(x, ti)
+        eqs[((i - 1) * n_x + 1):(i * n_x)] .= f(x, ti)
     end
     return
 end
-
 
 """
 $(SIGNATURES)
@@ -18,14 +28,13 @@ Constructs an array containing a Chebyshev basis in the variables `x` with coeff
 If `c` is an `Int` returns all coefficients from 1 to `c`.
 """
 function chebyshev_basis(x::Array, coefficients::AbstractVector)
-    eqs = Array{Num}(undef, size(x, 1)*length(coefficients))
+    eqs = Array{Num}(undef, size(x, 1) * length(coefficients))
     f(x, t) = cos.(t .* acos.(x))
     _generateBasis!(eqs, f, x, coefficients)
-    eqs
+    return eqs
 end
 
 chebyshev_basis(x::Array, terms::Int) = chebyshev_basis(x, 1:terms)
-
 
 """
 $(SIGNATURES)
@@ -34,14 +43,13 @@ Constructs an array containing a Sine basis in the variables `x` with coefficien
 If `c` is an `Int` returns all coefficients from 1 to `c`.
 """
 function sin_basis(x::Array, coefficients::AbstractVector)
-    eqs = Array{Num}(undef, size(x, 1)*length(coefficients))
+    eqs = Array{Num}(undef, size(x, 1) * length(coefficients))
     f(x, t) = sin.(t .* x)
     _generateBasis!(eqs, f, x, coefficients)
-    eqs
+    return eqs
 end
 
 sin_basis(x::Array, terms::Int) = sin_basis(x, 1:terms)
-
 
 """
 $(SIGNATURES)
@@ -50,14 +58,13 @@ Constructs an array containing a Cosine basis in the variables `x` with coeffici
 If `c` is an `Int` returns all coefficients from 1 to `c`.
 """
 function cos_basis(x::Array, coefficients::AbstractVector)
-    eqs = Array{Num}(undef, size(x, 1)*length(coefficients))
+    eqs = Array{Num}(undef, size(x, 1) * length(coefficients))
     f(x, t) = cos.(t .* x)
     _generateBasis!(eqs, f, x, coefficients)
-    eqs
+    return eqs
 end
 
 cos_basis(x::Array, terms::Int) = cos_basis(x, 1:terms)
-
 
 """
 $(SIGNATURES)
@@ -66,13 +73,34 @@ Constructs an array containing a Fourier basis in the variables `x` with (intege
 If `c` is an `Int` returns all coefficients from 1 to `c`.
 """
 function fourier_basis(x::Array, coefficients::AbstractVector{Int})
-    eqs = Array{Num}(undef, size(x, 1)*length(coefficients))
-    f(x, t) = iseven(t) ? cos.(t .* x ./ 2) : sin.(t .* x ./2)
+    eqs = Array{Num}(undef, size(x, 1) * length(coefficients))
+    f(x, t) = iseven(t) ? cos.(t .* x ./ 2) : sin.(t .* x ./ 2)
     _generateBasis!(eqs, f, x, coefficients)
-    eqs
+    return eqs
 end
 
 fourier_basis(x::Array, terms::Int) = fourier_basis(x, 1:terms)
+
+function _append_exponents!(
+        exponents::Vector{Vector{Int}}, current::Vector{Int}, index::Int, remaining::Int
+    )
+    if iszero(index)
+        push!(exponents, copy(current))
+        return
+    end
+
+    for exponent in 0:remaining
+        current[index] = exponent
+        _append_exponents!(exponents, current, index - 1, remaining - exponent)
+    end
+    return
+end
+
+function _bounded_exponents(n_variables::Int, degree::Int)
+    exponents = Vector{Vector{Int}}()
+    _append_exponents!(exponents, zeros(Int, n_variables), n_variables, degree)
+    return exponents
+end
 
 """
 $(SIGNATURES)
@@ -83,25 +111,19 @@ Constructs an array containing a polynomial basis in the variables `x` up to deg
 function polynomial_basis(x::Array, degree::Int = 1)
     @assert degree > 0
     n_x = length(x)
-    n_c = binomial(n_x+degree, degree)
-    eqs = Array{Num}(undef, n_c)
-    _check_degree(x) = sum(x)<=degree ? true : false
-    itr = Base.Iterators.product([0:degree for i in 1:n_x]...)
-    itr_ = Base.Iterators.Stateful(Base.Iterators.filter(_check_degree, itr))
-    filled = false
-    @inbounds for i in 1:n_c
-        eqs[i] = 1
-        filled = true
-        for (xi, ci) in zip(x, popfirst!(itr_))
-            if !iszero(ci)
-                filled ? eqs[i] = xi^ci : eqs[i] *= xi^ci
-                filled = false
+    exponents = _bounded_exponents(n_x, degree)
+    eqs = Array{Num}(undef, length(exponents))
+    @inbounds for (i, powers) in enumerate(exponents)
+        term = Num(1)
+        for (xi, exponent) in zip(x, powers)
+            if !iszero(exponent)
+                term *= xi^exponent
             end
         end
+        eqs[i] = term
     end
-    eqs
+    return eqs
 end
-
 
 """
 $(SIGNATURES)
@@ -119,8 +141,9 @@ function monomial_basis(x::AbstractArray, degree::Int = 1)
     eqs[1] = Num(1)
     idx = 0
     for i in 1:n_x, j in 1:n_e
-        idx = (i-1)*n_e+j+1
+
+        idx = (i - 1) * n_e + j + 1
         eqs[idx] = x[i]^exponents[j]
     end
-    eqs
+    return eqs
 end

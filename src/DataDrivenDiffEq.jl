@@ -3,50 +3,230 @@ $(DocStringExtensions.README)
 """
 module DataDrivenDiffEq
 
-using DocStringExtensions
-using LinearAlgebra
-using DiffEqBase
-using ModelingToolkit
+using LinearAlgebra: Diagonal, mul!, norm, normalize, svd
 
-using Distributions
-using QuadGK
-using Statistics
-using DataInterpolations
+import DiffEqBase
+using SciMLBase: SciMLBase, isdiscrete
+using CommonSolve: CommonSolve, init
+using Reexport: @reexport
+import ModelingToolkitBase
+using ModelingToolkitBase: @parameters, AbstractSystem, equations, get_iv, get_observed,
+    independent_variable, observed, parameters, unknowns
 
+using Parameters: @unpack, @with_kw
+using Setfield: @set!
 
-using Requires
-using ProgressMeter
-using Reexport
-using Compat
-using DocStringExtensions
+using SciMLStructures: SciMLStructures as SS
+using SciMLPublic: @public
+using SymbolicUtils: SymbolicUtils, arguments, iscall, issym, operation, simplify,
+    symtype, term, unwrap
+using Symbolics: Symbolics, @variables, Differential, Equation, Num, build_function,
+    get_variables, value, variable, wrap
 
+# Local Difference operator (removed from Symbolics v7)
+include("./difference.jl")
+export Difference
 
-@reexport using ModelingToolkit: states, parameters, independent_variable, observed, controls, get_iv
-@reexport using DataInterpolations: ConstantInterpolation, LinearInterpolation, QuadraticInterpolation, LagrangeInterpolation, QuadraticSpline, CubicSpline, BSplineInterpolation, BSplineApprox, Curvefit
-using Symbolics: scalarize, variable
+using Random: Random, shuffle
+using QuadGK: quadgk
+using Statistics: mean, median
+using StatsBase: StatsBase, UnitRangeTransform, ZScoreTransform, summarystats
+using StatsAPI: StatsAPI, StatisticalModel, aic, aicc, bic, dof, fit, loglikelihood,
+    nobs, nullloglikelihood, r2, rss
 
+import CurveFit
+import DataInterpolations
+using DataInterpolations: BSplineApprox, BSplineInterpolation, ConstantInterpolation,
+    CubicSpline, Curvefit, LagrangeInterpolation, LinearInterpolation,
+    QuadraticInterpolation, QuadraticSpline
 
-using ModelingToolkit: AbstractSystem
-using ModelingToolkit: value, operation, arguments, istree, get_observed
-# Basis and Koopman
+using MLUtils: splitobs, DataLoader
+
+using DocStringExtensions: DocStringExtensions, FIELDS, SIGNATURES, TYPEDEF
+using RecipesBase: @recipe, @series
+
+@reexport using CommonSolve: solve
+
+@enum DDProbType begin
+    Direct = 1 # Direct problem without further information
+    Discrete = 2 # Time discrete problem
+    Continuous = 3 # Time continuous problem
+end
+
+"""
+    DDReturnCode
+
+Return code for DataDrivenDiffEq solver results.
+
+The values indicate successful convergence, generic failure, and termination due to
+iteration, wall-time, absolute-tolerance, or relative-tolerance limits.
+"""
+@enum DDReturnCode begin
+    Success = 1
+    Failed = 2
+    ReachedMaxIters = 3
+    ReachedTimeLimit = 4
+    AbsTolLimit = 5
+    RelTolLimit = 6
+end
+
+export DDReturnCode
+
+# Helper
+const __EMPTY_MATRIX = Matrix(undef, 0, 0)
+const __EMPTY_VECTOR = Vector(undef, 0)
+
+# Basis with an indicator for implicit use
+abstract type AbstractDataDrivenFunction{Bool, Bool} end
+
+"""
+    AbstractBasis
+
+Supertype for symbolic feature bases accepted by data-driven algorithms. A basis
+maps measured states, parameters, time, and optional controls to feature values.
+
+# Interface
+
+Subtypes must provide the following interface:
+
+- `ModelingToolkitBase.equations(b)`, `unknowns(b)`, `parameters(b)`,
+  `get_observed(b)`, and `get_iv(b)` expose the symbolic system.
+- [`states`](@ref), [`controls`](@ref), [`is_implicit`](@ref), and
+  [`is_controlled`](@ref) describe the feature inputs.
+- [`get_f`](@ref) or [`dynamics`](@ref) returns the callable feature evaluator.
+- An explicit basis is callable as `b(u, p, t)` and, when controlled, as
+  `b(u, p, t, c)`. An implicit basis is callable as `b(du, u, p, t)` and,
+  when controlled, as `b(du, u, p, t, c)`.
+
+The default accessors use fields named `eqs`, `unknowns`, `ps`, `observed`, `iv`,
+`ctrls`, `implicit`, `f`, `name`, and `systems`. A subtype with different storage
+must provide equivalent methods explicitly. Solver-specific requirements, such as
+[`jacobian`](@ref) for Koopman algorithms, should be documented by that solver.
+
+# Example
+
+`Basis` is the standard implementation:
+
+```julia
+using DataDrivenDiffEq, Symbolics
+
+@variables x
+b = Basis([2x], [x])
+b([3.0], [], 0.0) # [6.0]
+```
+"""
 abstract type AbstractBasis <: AbstractSystem end
-abstract type AbstractKoopman <: AbstractBasis end
+
 # Collect the DataInterpolations Methods into an Interpolation Type
 abstract type AbstractInterpolationMethod end
 abstract type CollocationKernel end
 
-# Algortihms for Koopman
-abstract type AbstractKoopmanAlgorithm end
+# Algorithms
+"""
+    AbstractDataDrivenAlgorithm
 
-# Abstract symbolic_regression
-abstract type AbstractSymbolicRegression end
+Supertype for algorithms that solve data-driven problems.
+
+# Interface
+
+An algorithm package must define `CommonSolve.solve!` for
+`InternalDataDrivenProblem{A}` and return a [`DataDrivenSolution`](@ref). The
+implementation must accept the preprocessed data and options in that internal
+problem, and must not require callers to construct the internal representation.
+
+The default [`get_fit_targets`](@ref) evaluates the basis and returns the problem's
+implicit data. An algorithm may specialize it when its regression targets differ
+from the problem's implicit data. The algorithm's callable form and keyword
+arguments are solver-specific and must be documented by the concrete algorithm.
+
+# Example
+
+```julia
+struct MyAlgorithm <: DataDrivenDiffEq.AbstractDataDrivenAlgorithm end
+
+DataDrivenDiffEq.get_fit_targets(::MyAlgorithm, problem, basis) =
+    (basis(problem), DataDrivenDiffEq.get_implicit_data(problem))
+```
+"""
+abstract type AbstractDataDrivenAlgorithm end
+
+"""
+    AbstractDataDrivenResult
+
+Supertype for algorithm-specific result objects stored by [`DataDrivenSolution`](@ref).
+
+# Interface
+
+Result types must implement the applicable `StatsAPI.StatisticalModel` accessors:
+`coef`, `rss`, `dof`, `nobs`, `loglikelihood`, `nullloglikelihood`, and `r2`.
+Solver packages should also provide a success predicate and a return code so that
+failed fits can be excluded from model selection. The result fields and the meaning
+of each statistic must be documented by the concrete result type.
+"""
+abstract type AbstractDataDrivenResult <: StatisticalModel end
 
 # Problem and solution
-abstract type AbstractDataDrivenProblem{dType, cType, probType} end
-abstract type AbstractDataDrivenSolution end
+"""
+    AbstractDataDrivenProblem{N, C, K}
 
+Supertype for data containers consumed by data-driven algorithms.
 
+# Interface
 
+`N` is the numeric element type, `C` records whether controls are present, and `K`
+is `DDProbType(1)`, `DDProbType(2)`, or `DDProbType(3)` for direct, discrete, or
+continuous data. Problem subtypes must implement:
+
+- [`get_implicit_data`](@ref): the target matrix used by the default algorithm.
+- [`get_oop_args`](@ref): `(X, p, t, U)` aligned with that target matrix.
+- [`remake_problem`](@ref): a same-kind problem with selected data replaced by
+  keyword arguments.
+- [`is_valid`](@ref): validation of finite values and compatible sample lengths.
+
+They must also expose state, control, parameter, time, and observed data through
+the corresponding ModelingToolkit accessors or equivalent package methods. For a
+discrete problem, inputs and targets must be offset by one sample; for direct and
+continuous problems they must have the same sample count.
+
+# Example
+
+`DataDrivenProblem` is the reference implementation:
+
+```julia
+X = [1.0 2.0 3.0]
+problem = DirectDataDrivenProblem(X, 2 .* X)
+get_implicit_data(problem) == 2 .* X
+```
+"""
+abstract type AbstractDataDrivenProblem{Number, Bool, DDProbType} end
+
+# Define some alias type for easier dispatch
+"""
+    ABSTRACT_DIRECT_PROB{N, C}
+
+Developer dispatch alias for direct [`AbstractDataDrivenProblem`](@ref) subtypes.
+"""
+const ABSTRACT_DIRECT_PROB{N, C} = AbstractDataDrivenProblem{N, C, DDProbType(1)}
+
+"""
+    ABSTRACT_DISCRETE_PROB{N, C}
+
+Developer dispatch alias for discrete [`AbstractDataDrivenProblem`](@ref) subtypes.
+"""
+const ABSTRACT_DISCRETE_PROB{N, C} = AbstractDataDrivenProblem{N, C, DDProbType(2)}
+
+"""
+    ABSTRACT_CONT_PROB{N, C}
+
+Developer dispatch alias for continuous [`AbstractDataDrivenProblem`](@ref) subtypes.
+"""
+const ABSTRACT_CONT_PROB{N, C} = AbstractDataDrivenProblem{N, C, DDProbType(3)}
+
+abstract type AbstractDataDrivenSolution <: StatisticalModel end
+
+# Fallback result and algorithm
+struct ErrorDataDrivenResult <: AbstractDataDrivenResult end
+struct ZeroDataDrivenAlgorithm <: AbstractDataDrivenAlgorithm end
 
 ## Basis
 
@@ -55,7 +235,8 @@ include("./basis/utils.jl")
 include("./basis/type.jl")
 export Basis
 export jacobian, dynamics
-export free_parameters
+export implicit_variables, states, controls
+export get_parameter_values, get_parameter_map
 
 include("./utils/basis_generators.jl")
 export chebyshev_basis, monomial_basis, polynomial_basis
@@ -63,96 +244,73 @@ export sin_basis, cos_basis, fourier_basis
 
 include("./utils/collocation.jl")
 export InterpolationMethod
-export EpanechnikovKernel, UniformKernel, TriangularKernel,QuarticKernel
+export EpanechnikovKernel, UniformKernel, TriangularKernel, QuarticKernel
 export TriweightKernel, TricubeKernel, GaussianKernel, CosineKernel
 export LogisticKernel, SigmoidKernel, SilvermanKernel
 export collocate_data
 
 include("./utils/utils.jl")
-export AIC, AICC, BIC
 export optimal_shrinkage, optimal_shrinkage!
-export burst_sampling, subsample
 
-## Sparse Regression
-
-include("./optimizers/Optimize.jl")
-@reexport using DataDrivenDiffEq.Optimize: sparse_regression!
-@reexport using DataDrivenDiffEq.Optimize: set_threshold!, get_threshold
-@reexport using DataDrivenDiffEq.Optimize: STLSQ, ADMM, SR3
-@reexport using DataDrivenDiffEq.Optimize: ImplicitOptimizer
-@reexport using DataDrivenDiffEq.Optimize: SoftThreshold, HardThreshold, ClippedAbsoluteDeviation
-
-## Koopman
-
-include("./koopman/type.jl")
-export Koopman
-export operator, generator
-export is_stable, is_discrete, is_continuous
-export modes, frequencies, outputmap, updatable
-export update!
-
-include("./koopman/algorithms.jl")
-export DMDPINV, DMDSVD, TOTALDMD
-
-
-## Problem and Solution
-# Use to distinguish the problem types
-@enum DDProbType begin
-    Direct=1 # Direct problem without further information
-    Discrete=2 # Time discrete problem
-    Continuous=3 # Time continous problem
-end
-
-
-# Define some alias type for easier dispatch
-const AbstractDirectProb{N,C} = AbstractDataDrivenProblem{N,C,DDProbType(1)}
-const AbstractDiscreteProb{N,C} = AbstractDataDrivenProblem{N,C,DDProbType(2)}
-const AbstracContProb{N,C} = AbstractDataDrivenProblem{N,C,DDProbType(3)}
-
-
-include("./problem.jl")
+include("./problem/type.jl")
 
 export DataDrivenProblem
 export DiscreteDataDrivenProblem, ContinuousDataDrivenProblem, DirectDataDrivenProblem
 export is_autonomous, is_discrete, is_direct, is_continuous, is_parametrized, has_timepoints
-export is_valid
+export is_valid, @is_applicable, get_name
 
+include("./problem/set.jl")
+export DataDrivenDataset
+export DirectDataset, DiscreteDataset, ContinuousDataset
+
+include("./utils/data_processing.jl")
+export DataProcessing, DataNormalization
+
+include("./utils/common_options.jl")
+export DataDrivenCommonOptions
+
+include("./commonsolve.jl")
 
 include("./solution.jl")
 export DataDrivenSolution
-export result, parameters, parameter_map, algorithm
-export output, metrics, error, aic, determination
+export get_algorithm, get_results, get_basis, is_converged, get_problem
 
-include("./solve/sindy.jl")
-include("./solve/koopman.jl")
-export solve
+# Reexported upstream API, approved via `reexports_allow` in test/qa/qa.jl, so that
+# `using DataDrivenDiffEq` on its own is enough to write a `Basis`, choose a collocation
+# method, normalize and batch the data, and inspect the recovered system. Every name
+# stays owned and documented by its upstream package.
 
-# Optional
-function __init__()
-    # Load and export OccamNet
-    @require Flux="587475ba-b771-5e3f-ad9e-33799f191a9c" begin
+# The symbolic DSL a `Basis` is written in.
+export @variables, @parameters, Differential, Equation, Num, build_function, get_variables
 
-        using .Flux
-        include("./symbolic_regression/occamnet.jl")
+# The ModelingToolkitBase accessors that expose a recovered `Basis` as a symbolic system;
+# see the `AbstractBasis` docstring above.
+export equations, get_iv, get_observed, independent_variable, observed, parameters,
+    unknowns
 
-        export OccamNet,ProbabilityLayer
-        export set_temp!
-        export probability, logprobability
-        export probabilities, logprobabilities
-        export OccamSR
+# The `StatsAPI`/`StatsBase` statistical interface implemented by `DataDrivenSolution` and
+# the algorithm results; see the "Statistical interface" section of the solutions docs.
+export aic, aicc, bic, dof, loglikelihood, nobs, nullloglikelihood, r2, rss, summarystats
 
-        @info "DataDrivenDiffEq : OccamNet is available."
-    end
+# The `DataInterpolations` methods that can be wrapped by `InterpolationMethod` to supply
+# derivatives to a `ContinuousDataDrivenProblem`.
+export BSplineApprox, BSplineInterpolation, ConstantInterpolation, CubicSpline, Curvefit,
+    LagrangeInterpolation, LinearInterpolation, QuadraticInterpolation, QuadraticSpline
 
-    @require SymbolicRegression = "8254be44-1295-4e6a-a16d-46603ac705cb" begin
+# The batching and normalization types named by `DataProcessing` and `DataNormalization`.
+export DataLoader, splitobs
+export UnitRangeTransform, ZScoreTransform
 
-        using .SymbolicRegression
-        include("./symbolic_regression/symbolic_regression.jl")
-        export EQSearch
+@public AbstractBasis, AbstractDataDrivenAlgorithm, AbstractDataDrivenResult,
+    AbstractDataDrivenProblem, ABSTRACT_DIRECT_PROB, ABSTRACT_DISCRETE_PROB,
+    ABSTRACT_CONT_PROB, InternalDataDrivenProblem, get_fit_targets, is_implicit,
+    is_controlled, get_f, get_implicit_data, get_oop_args, remake_problem, assert_lhs,
+    apply_transform, apply_transform!, __construct_basis
 
-        @info "DataDrivenDiffEq : Symboolic Regression is available."
-    end
+include("./utils/plot_recipes.jl")
+include("./utils/build_basis.jl")
 
-end
+# Precompilation workload to improve startup time and TTFX
+include("./precompilation.jl")
 
 end # module

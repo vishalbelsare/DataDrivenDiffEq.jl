@@ -1,0 +1,17 @@
+# Test group declarations for the DataDrivenDiffEq root package.
+# The base-environment Core group runs in the package's main test env and is
+# the only group in the `All` run. The `QA` group is a dep-adding group: it
+# carries JET in test/qa/Project.toml, is excluded from `All`, and does not run
+# on prerelease Julia.
+
+[Core]
+versions = ["lts", "1", "pre"]
+
+["Core 32-bit"]
+group = "Core"
+versions = ["1"]
+os = ["ubuntu-latest"]
+arch = "x86"
+
+[QA]
+versions = ["lts", "1"]

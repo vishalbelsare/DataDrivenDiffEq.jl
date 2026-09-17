@@ -1,0 +1,82 @@
+# DataDrivenSparse
+
+DataDrivenSparse provides a universal framework to infer systems of equations using sparse regression. Assume the system:
+
+```math
+y_{i} = f(x_{i}, p, t_i, u_{i})
+```
+
+We might then be able to express the unknown function $f$ as a linear combination of basis elements $\varphi_i : \mathbb R^{n_x} \times \mathbb R^{n_p} \times \mathbb R \times \mathbb R^{n_u} \mapsto \mathbb R$ .
+
+```math
+y_i = \sum_{j=1}^k \xi_k ~ \varphi_k\left(x_i, p, t_i, u_i \right)
+```
+
+And simply solve the least squares problem
+
+```math
+\Xi' = \min_{\Xi} \lVert Y - \Xi \varPhi \rVert_2^2
+```
+
+In the simplest case, we could use a Taylor expansion. However, if we want interpretable results, we need a key ingredient: sparsity! So, instead we aim to solve the problem
+
+```math
+\Xi' = \min_{\Xi} \lVert\Xi \rVert_0 \\
+\text{s.t.} \qquad \Xi \varPhi =  Y
+```
+
+In its original version or via sufficient relaxation of the $L_0$ norm.
+
+Similarly, implicit problems of the form
+
+```math
+f(y_i, x_i, p, t_i, u_i) = 0
+```
+
+can be solved using an [`ImplicitOptimizer`](@ref). Similar to the formulation above, we try to solve the corresponding optimization problem
+
+```math
+\Xi' = \min_{\Xi} \lVert\Xi \rVert_0 \\
+\text{s.t.} \qquad \Xi \varPhi_y =  0
+```
+
+Where the matrix of evaluated basis elements $\varPhi_y \in \mathbb R^{\lvert \varphi \rvert} \times \mathbb R^{m}$ now may also contain basis functions which are dependent on the target variables $y \in \mathbb R^{n_y}$.
+
+!!! warning "Tuning parameters for sparse regression"
+
+    The algorithms used by `DataDrivenSparse` are sensitive to the tuning of the hyperparameters! These are problem and coefficient specific, e.g., depend on the data and the unknown equations. While the examples used here are designed to work well, the used settings are not guaranteed to lead to success on other problems. Users who want to explore the space of possible hyperparameters further might be interested in using [Hyperopt.jl](https://github.com/baggepinnen/Hyperopt.jl).
+
+## [Algorithms](@id sparse_algorithms)
+
+The abstract algorithm and proximal operator entries below are developer
+interfaces for extending `DataDrivenSparse`. Application code should generally
+use the concrete algorithms and operators.
+
+```@docs
+DataDrivenSparse.AbstractSparseRegressionAlgorithm
+DataDrivenSparse.AbstractSparseRegressionCache
+DataDrivenSparse.get_thresholds
+DataDrivenSparse.get_relaxation
+DataDrivenSparse.get_proximal
+DataDrivenSparse.init_cache
+DataDrivenSparse.step!
+STLSQ
+ADMM
+SR3
+WyNDA
+ImplicitOptimizer
+SparseLinearSolver
+```
+
+## [Proximal Operators](@id proximal_operators)
+
+Custom proximal operators should subtype `AbstractProximalOperator` and
+implement the documented callable and active-set methods.
+
+```@docs
+DataDrivenSparse.AbstractProximalOperator
+DataDrivenSparse.active_set!
+SoftThreshold
+HardThreshold
+ClippedAbsoluteDeviation
+```

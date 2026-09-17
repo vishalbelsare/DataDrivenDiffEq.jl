@@ -1,0 +1,99 @@
+"""
+$(TYPEDEF)
+
+Dataset used by DataDrivenLux candidate models, storing observed inputs,
+targets, controls, time points, and interval bounds for symbolic search.
+
+# Fields
+
+$(FIELDS)
+
+# Arguments
+
+- `X::AbstractMatrix`: state or feature data, with observations in columns.
+- `Y::AbstractMatrix`: target data, with target variables in rows.
+- `U::AbstractMatrix`: optional control data; defaults to an empty matrix.
+- `t::AbstractVector`: optional time points; defaults to equally spaced indices.
+
+# Returns
+
+Return a promoted, interval-annotated dataset used by candidate models.
+"""
+@concrete struct Dataset{T}
+    x <: AbstractMatrix{T}
+    y <: AbstractMatrix{T}
+    u <: AbstractMatrix{T}
+    t <: AbstractVector{T}
+    x_intervals <: AbstractVector{Interval{T}}
+    y_intervals <: AbstractVector{Interval{T}}
+    u_intervals <: AbstractVector{Interval{T}}
+    t_interval <: Interval{T}
+end
+
+Base.eltype(::Dataset{T}) where {T} = T
+
+function Dataset(
+        X::AbstractMatrix, Y::AbstractMatrix,
+        U::AbstractMatrix = Array{eltype(X)}(undef, 0, 0),
+        t::AbstractVector = Array{eltype(X)}(undef, 0)
+    )
+    T = promote_type(map(eltype, (X, Y, U, t))...)
+    X = convert.(T, X)
+    Y = convert.(T, Y)
+    U = convert.(T, U)
+    t = convert.(T, t)
+    t = isempty(t) ? convert.(T, LinRange(0, size(Y, 2) - 1, size(Y, 2))) : convert.(T, t)
+    # IA 1.x `interval(x)` treats a Tuple as one endpoint and hits `_interval_infsup(::Type{Any}, ...)`.
+    # Splatting extrema into two endpoints matches the public `interval(lo, hi)` API.
+    x_intervals = [interval(lo, hi) for (lo, hi) in map(extrema, eachrow(X))]
+    y_intervals = [interval(lo, hi) for (lo, hi) in map(extrema, eachrow(Y))]
+    u_intervals = [interval(lo, hi) for (lo, hi) in map(extrema, eachrow(U))]
+    t_intervals = isempty(t) ? interval(zero(T), zero(T)) : interval(extrema(t)...)
+    return Dataset{T}(X, Y, U, t, x_intervals, y_intervals, u_intervals, t_intervals)
+end
+
+function Dataset(prob::DataDrivenDiffEq.DataDrivenProblem)
+    X, _, t, U = DataDrivenDiffEq.get_oop_args(prob)
+    Y = DataDrivenDiffEq.get_implicit_data(prob)
+    return Dataset(X, Y, U, t)
+end
+
+function (b::Basis{false, false})(d::Dataset{T}, p::P) where {T, P}
+    f = DataDrivenDiffEq.get_f(b)
+    return f(d.x, p, d.t)
+end
+
+function (b::Basis{false, true})(d::Dataset{T}, p::P) where {T, P}
+    f = DataDrivenDiffEq.get_f(b)
+    return f(d.x, p, d.t, d.u)
+end
+
+function (b::Basis{true, false})(d::Dataset{T}, p::P) where {T, P}
+    f = DataDrivenDiffEq.get_f(b)
+    return f(d.y, d.x, p, d.t)
+end
+
+function (b::Basis{true, true})(d::Dataset{T}, p::P) where {T, P}
+    f = DataDrivenDiffEq.get_f(b)
+    return f(d.y, d.x, p, d.t, d.u)
+end
+
+function interval_eval(b::Basis{false, false}, d::Dataset{T}, p::P) where {T, P}
+    f = DataDrivenDiffEq.get_f(b)
+    return f(d.x_intervals, p, d.t_interval)
+end
+
+function interval_eval(b::Basis{false, true}, d::Dataset{T}, p::P) where {T, P}
+    f = DataDrivenDiffEq.get_f(b)
+    return f(d.x_intervals, p, d.t_interval, d.u_intervals)
+end
+
+function interval_eval(b::Basis{true, false}, d::Dataset{T}, p::P) where {T, P}
+    f = DataDrivenDiffEq.get_f(b)
+    return f(d.y_intervals, d.x_intervals, p, d.t_interval)
+end
+
+function interval_eval(b::Basis{true, true}, d::Dataset{T}, p::P) where {T, P}
+    f = DataDrivenDiffEq.get_f(b)
+    return f(d.y_intervals, d.x_intervals, p, d.t_interval, d.u_intervals)
+end

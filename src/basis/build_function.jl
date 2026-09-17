@@ -1,192 +1,333 @@
-# Helper to build function
-# TODO eval -> Runtime generated
-function _build_ddd_function(rhs, states, parameters, iv, eval_expression::Bool = false)
-
-    if eval_expression
-        f_oop, f_iip = eval.(build_function(rhs, value.(states), value.(parameters), [value(iv)], expression = Val{true}))
-    else
-        f_oop, f_iip = build_function(rhs, value.(states), value.(parameters), [value(iv)], expression = Val{false})
-    end
-
-    function f(
-        u::AbstractVector{T} where T,
-        p::AbstractVector{T} where T,
-        t::T where T
-    )
-        return f_oop(u, p, t)
-    end
-
-    function f(
-        du::AbstractVector{T} where T,
-        u::AbstractVector{T} where T,
-        p::AbstractVector{T} where T,
-        t::T where T
-    )
-        return f_iip(du, u, p, t)
-    end
-
-    function f(
-        x::AbstractMatrix{T} where T,
-        p::AbstractVector{T} where T,
-        t::AbstractVector{T} where T
-    )
-        @assert size(x, 2) == length(t) "Measurements and time points must be of equal length!"
-
-        return hcat([f(x[:,i], p, t[i]) for i in 1:size(x, 2)]...)
-
-    end
-
-
-    function f(
-        y::AbstractMatrix{T} where T,
-        x::AbstractMatrix{T} where T,
-        p::AbstractVector{T} where T,
-        t::AbstractVector{T} where T
-    )
-        @assert size(x, 2) == length(t) "Measurements and time points must be of equal length!"
-        @assert size(x, 2) == size(y, 2) "Measurements and preallocated output must be of equal length!"
-
-        for i = 1:size(x, 2)
-            @views f(y[:, i], x[:, i], p, t[i])
-        end
-
-        return
-    end
-
-
-    # Dispatch on DiffEqBase.NullParameters
-    f(u,p::DiffEqBase.NullParameters, t) = f(u,[], t)
-    f(du, u,p::DiffEqBase.NullParameters, t) = f(du, u,[], t)
-
-    # And on the controls
-    f(u,p,t,input) = f(u,p,t)
-    f(du,u,p,t,input) = f(du,u,p,t)
-
-    return f
+struct DataDrivenFunction{IMPL, CTRLS, F1, F2} <: AbstractDataDrivenFunction{IMPL, CTRLS}
+    f_oop::F1
+    f_iip::F2
 end
 
+function DataDrivenFunction(
+        rhs, implicits, states, parameters, iv, controls,
+        eval_expression = false
+    )
+    _is_implicit = !isempty(implicits)
+    _is_controlled = !isempty(controls)
 
-function _build_ddd_function(
-    rhs,
-    states,
-    parameters,
-    iv,
-    controls,
-    eval_expression::Bool = false,
-)
-
-    length(controls) < 1 &&
-        return _build_ddd_function(rhs, states, parameters, iv, eval_expression)
-
-    # Assumes zero control is zero!
-
-    if eval_expression
-        c_oop, c_iip =
-            eval.(
-                build_function(
-                    rhs,
-                    value.(states),
-                    value.(parameters),
-                    [value(iv)],
-                    value.(controls),
-                    expression = Val{true},
-                ),
-            )
-    else
-        c_oop, c_iip = build_function(
+    if !eval_expression
+        f_oop,
+            f_iip = build_function(
             rhs,
-            value.(states),
+            value.(implicits), value.(states), value.(parameters),
+            [value(iv)], value.(controls),
+            expression = Val{false}
+        )
+    else
+        ex_oop,
+            ex_iip = build_function(
+            rhs,
+            value.(implicits), value.(states),
             value.(parameters),
-            [value(iv)],
-            value.(controls),
-            expression = Val{false},
+            [value(iv)], value.(controls),
+            expression = Val{true}
+        )
+        f_oop = eval(ex_oop)
+        f_iip = eval(ex_iip)
+    end
+
+    return DataDrivenFunction{_is_implicit, _is_controlled, typeof(f_oop), typeof(f_iip)}(
+        f_oop,
+        f_iip
+    )
+end
+
+_apply_function(f::DataDrivenFunction, du, u, p, t, c) = begin
+    (; f_oop) = f
+    f_oop(du, u, p, t, c)
+end
+
+function _apply_function!(f::DataDrivenFunction, res, du, u, p, t, c)
+    (; f_iip) = f
+    return f_iip(res, du, u, p, t, c)
+end
+
+# Dispatch
+
+# OOP
+
+# Without controls or implicits
+function (f::DataDrivenFunction{false, false})(
+        u::AbstractVector, p::P,
+        t::Number
+    ) where {
+        P <:
+        Union{
+            AbstractArray, Tuple,
+        },
+    }
+    return _apply_function(f, __EMPTY_VECTOR, u, p, t, __EMPTY_VECTOR)
+end
+
+# Without implicits, with controls
+function (f::DataDrivenFunction{false, true})(
+        u::AbstractVector, p::P, t::Number,
+        c::AbstractVector
+    ) where {
+        P <:
+        Union{
+            AbstractArray,
+            Tuple,
+        },
+    }
+    return _apply_function(f, __EMPTY_VECTOR, u, p, t, c)
+end
+
+# With implicit, without controls
+function (f::DataDrivenFunction{true, false})(
+        du::AbstractVector, u::AbstractVector, p::P,
+        t::Number
+    ) where {
+        P <:
+        Union{AbstractArray, Tuple},
+    }
+    return _apply_function(f, du, u, p, t, __EMPTY_VECTOR)
+end
+
+# With implicit and controls
+function (f::DataDrivenFunction{true, true})(
+        du::AbstractVector, u::AbstractVector, p::P,
+        t::Number,
+        c::AbstractVector
+    ) where {
+        P <:
+        Union{
+            AbstractArray,
+            Tuple,
+        },
+    }
+    return _apply_function(f, du, u, p, t, c)
+end
+
+# IIP
+
+# Without controls or implicits
+function (f::DataDrivenFunction{false, false})(
+        res::AbstractVector, u::AbstractVector, p::P,
+        t::Number
+    ) where {
+        P <:
+        Union{
+            AbstractArray, Tuple,
+        },
+    }
+    return _apply_function!(f, res, __EMPTY_VECTOR, u, p, t, __EMPTY_VECTOR)
+end
+
+# Without implicits, with controls
+function (f::DataDrivenFunction{false, true})(
+        res::AbstractVector, u::AbstractVector, p::P,
+        t::Number,
+        c::AbstractVector
+    ) where {
+        P <:
+        Union{
+            AbstractArray,
+            Tuple,
+        },
+    }
+    return _apply_function!(f, res, __EMPTY_VECTOR, u, p, t, c)
+end
+
+# With implicit, without controls
+function (f::DataDrivenFunction{true, false})(
+        res::AbstractVector, du::AbstractVector,
+        u::AbstractVector, p::P,
+        t::Number
+    ) where {
+        P <:
+        Union{AbstractArray, Tuple},
+    }
+    return _apply_function!(f, res, du, u, p, t, __EMPTY_VECTOR)
+end
+
+# With implicit and controls
+function (f::DataDrivenFunction{true, true})(
+        res::AbstractVector, du::AbstractVector,
+        u::AbstractVector, p::P, t::Number,
+        c::AbstractVector
+    ) where {
+        P <:
+        Union{
+            AbstractArray,
+            Tuple,
+        },
+    }
+    return _apply_function!(f, res, du, u, p, t, c)
+end
+
+##
+
+## Matrix
+maybeview(x::AbstractMatrix, id) = isempty(x) ? x : view(x, :, id)
+maybeview(x::AbstractVector, id) = isempty(x) ? x : view(x, id)
+maybeview(x, id) = x
+
+function _check_array_inputs(res, du, u, p, t, c)
+    # Collect the keys here
+    n_obs = size(u, 2)
+    @assert n_obs == length(t) "Number of observations $(n_obs) does not match timepoints $(length(t))"
+
+    isempty(du) ||
+        @assert n_obs == size(du, 2) "Number of observations $(n_obs) does not match implicits $(size(du, 2))"
+
+    isempty(c) ||
+        @assert n_obs == size(c, 2) "Number of observations $(n_obs) does not match controls $(size(c, 2))"
+
+    return isempty(res) ||
+        @assert n_obs == size(res, 2) "Number of observations $(n_obs) does not match residuals $(size(res, 2))"
+end
+
+function _apply_vec_function(
+        f::DataDrivenFunction, du::AbstractMatrix, u::AbstractMatrix,
+        p::AbstractVector, t::AbstractVector, c::AbstractMatrix
+    )
+    _check_array_inputs(__EMPTY_MATRIX, du, u, p, t, c)
+
+    return reduce(
+        hcat,
+        map(axes(u, 2)) do i
+            _apply_function(
+                f,
+                maybeview(du, i),
+                maybeview(u, i),
+                view(p, :),
+                maybeview(t, i),
+                maybeview(c, i)
+            )
+        end
+    )
+end
+
+function _apply_vec_function!(
+        f::DataDrivenFunction, res::AbstractMatrix,
+        du::AbstractMatrix, u::AbstractMatrix, p::AbstractVector,
+        t::AbstractVector, c::AbstractMatrix
+    )
+    _check_array_inputs(res, du, u, p, t, c)
+
+    return foreach(axes(u, 2)) do i
+        _apply_function!(
+            f,
+            maybeview(res, i),
+            maybeview(du, i), maybeview(u, i), view(p, :),
+            maybeview(t, i), maybeview(c, i)
         )
     end
+end
 
-    function f(
-        u::AbstractVector{T} where T,
-        p::AbstractVector{T} where T,
-        t::T where T,
-        c::AbstractVector{T} where T = zeros(eltype(u), size(controls)...),
-    )
-        return c_oop(u, p, t, c)
-    end
+## OOP
 
-    function f(
-        du::AbstractVector{T} where T,
-        u::AbstractVector{T} where T,
-        p::AbstractVector{T} where T,
-        t::T where T,
-        c::AbstractVector{T} where T= zeros(eltype(u), size(controls)...),
-    )
-        return c_iip(du, u, p, t, c)
-    end
+function (f::DataDrivenFunction{false, false})(
+        u::AbstractMatrix, p::P,
+        t::AbstractVector
+    ) where {
+        P <: Union{
+            AbstractArray,
+            Tuple,
+        },
+    }
+    return _apply_vec_function(f, __EMPTY_MATRIX, u, p, t, __EMPTY_MATRIX)
+end
 
+function (f::DataDrivenFunction{false, true})(
+        u::AbstractMatrix, p::P, t::AbstractVector,
+        c::AbstractMatrix
+    ) where {
+        P <:
+        Union{
+            AbstractArray,
+            Tuple,
+        },
+    }
+    return _apply_vec_function(f, __EMPTY_MATRIX, u, p, t, c)
+end
 
-    function f(
-        x::AbstractMatrix{T} where T,
-        p::AbstractVector{T} where T,
-        t::AbstractVector{T} where T
-    )
-        @assert size(x, 2) == length(t) "Measurements and time points must be of equal length!"
+function (f::DataDrivenFunction{true, false})(
+        du::AbstractMatrix, u::AbstractMatrix, p::P,
+        t::AbstractVector
+    ) where {
+        P <:
+        Union{
+            AbstractArray,
+            Tuple,
+        },
+    }
+    return _apply_vec_function(f, du, u, p, t, __EMPTY_MATRIX)
+end
 
-        return hcat([f(x[:,i], p, t[i]) for i in 1:size(x, 2)]...)
+function (f::DataDrivenFunction{true, true})(
+        du::AbstractMatrix, u::AbstractMatrix, p::P,
+        t::AbstractVector,
+        c::AbstractMatrix
+    ) where {
+        P <:
+        Union{
+            AbstractArray,
+            Tuple,
+        },
+    }
+    return _apply_vec_function(f, du, u, p, t, c)
+end
 
-    end
+## IIP
 
-    function f(
-        y::AbstractMatrix{T} where T,
-        x::AbstractMatrix{T} where T,
-        p::AbstractVector{T} where T,
-        t::AbstractVector{T} where T
-    )
-        @assert size(x, 2) == length(t) "Measurements and time points must be of equal length!"
-        @assert size(x, 2) == size(y, 2) "Measurements and preallocated output must be of equal length!"
+function (f::DataDrivenFunction{false, false})(
+        res::AbstractMatrix, u::AbstractMatrix, p::P,
+        t::AbstractVector
+    ) where {
+        P <: Union{
+            AbstractArray,
+            Tuple,
+        },
+    }
+    return _apply_vec_function!(f, res, __EMPTY_MATRIX, u, p, t, __EMPTY_MATRIX)
+end
 
-        for i = 1:size(x, 2)
-            @views f(y[:, i], x[:, i], p, t[i])
-        end
+function (f::DataDrivenFunction{false, true})(
+        res::AbstractMatrix, u::AbstractMatrix, p::P,
+        t::AbstractVector,
+        c::AbstractMatrix
+    ) where {
+        P <:
+        Union{
+            AbstractArray,
+            Tuple,
+        },
+    }
+    return _apply_vec_function!(f, res, __EMPTY_MATRIX, u, p, t, c)
+end
 
-        return
-    end
+function (f::DataDrivenFunction{true, false})(
+        res::AbstractMatrix, du::AbstractMatrix,
+        u::AbstractMatrix, p::P,
+        t::AbstractVector
+    ) where {
+        P <:
+        Union{
+            AbstractArray,
+            Tuple,
+        },
+    }
+    return _apply_vec_function!(f, res, du, u, p, t, __EMPTY_MATRIX)
+end
 
-
-    function f(
-        x::AbstractMatrix{T} where T,
-        p::AbstractVector{T} where T,
-        t::AbstractVector{T} where T,
-        u::AbstractMatrix{T} where T
-    )
-        @assert size(x, 2) == length(t) "Measurements and time points must be of equal length!"
-        @assert size(x, 2) == size(u, 2) "Measurements and inputs must be of equal length!"
-
-
-        return hcat([f(x[:,i], p, t[i], u[:, i]) for i in 1:size(x, 2)]...)
-
-    end
-
-    function f(
-        y::AbstractMatrix{T} where T,
-        x::AbstractMatrix{T} where T,
-        p::AbstractVector{T} where T,
-        t::AbstractVector{T} where T,
-        u::AbstractMatrix{T} where T
-    )
-        @assert size(x, 2) == length(t) "Measurements and time points must be of equal length!"
-        @assert size(x, 2) == size(y, 2) "Measurements and preallocated output must be of equal length!"
-        @assert size(x, 2) == size(u, 2) "Measurements and inputs must be of equal length!"
-
-        for i = 1:size(x, 2)
-            @views f(y[:, i], x[:, i], p, t[i], u[:, i])
-        end
-
-        return
-    end
-
-    # Dispatch on DiffEqBase.NullParameters
-    f(u,p::DiffEqBase.NullParameters, t) = f(u,[], t)
-    f(du, u,p::DiffEqBase.NullParameters, t) = f(du, u,[], t)
-
-
-    return f
+function (f::DataDrivenFunction{true, true})(
+        res::AbstractMatrix, du::AbstractMatrix,
+        u::AbstractMatrix, p::P,
+        t::AbstractVector,
+        c::AbstractMatrix
+    ) where {
+        P <:
+        Union{
+            AbstractArray,
+            Tuple,
+        },
+    }
+    return _apply_vec_function!(f, res, du, u, p, t, c)
 end

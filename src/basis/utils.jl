@@ -1,49 +1,26 @@
-## Get unary and binary functions
-
-function is_unary(f::Function, t::Type = Number)
-    f ∈ [+, -, *, /, ^] && return false
-    for m in methods(f, (t, ))
-        m.nargs - 1 > 1 && return false
-    end
-    return true
-end
-
-function is_binary(f::Function, t::Type = Number)
-    f ∈ [+, -, *, /, ^] && return true
-    !is_unary(f, t)
-end
-
-function ariety(f::Function, t::Type = Number)
-    is_unary(f, t) && return 1
-    is_binary(f, t) && return 2
-    return 0
-end
-
-function sort_ops(f::Vector{Function})
-    U = Function[]
-    B = Function[]
-    for fi in f
-        is_unary(fi) ? push!(U, fi) : push!(B, fi)
-    end
-    return U, B
-end
-
 ## Create linear independent basis
 
-count_operation(x::Number, op::Function, nested::Bool = true) = 0
-count_operation(x::Sym, op::Function, nested::Bool = true) = 0
-count_operation(x::Num, op::Function, nested::Bool = true) = count_operation(value(x), op, nested)
+# Helper to check if x is a constant (Number or SymbolicUtils Const type)
+_is_constant(x::Number) = true
+function _is_constant(x)
+    # In SymbolicUtils v4+, constants are wrapped in Const type
+    # Check using isconst if available
+    return SymbolicUtils.isconst(x)
+end
 
-function count_operation(x, op::Function, nested::Bool = true)
-    if operation(x)== op
+count_operation(x::Number, op::Function, nested::Bool = true) = 0
+function count_operation(x::SymbolicUtils.BasicSymbolic, op::Function, nested::Bool = true)
+    # Check if x is a symbol or not a call (e.g., Const in SymbolicUtils v4)
+    (issym(x) || !iscall(x)) && return 0
+    if operation(x) == op
         if is_unary(op)
             # Handles sin, cos and stuff
             nested && return 1 + count_operation(arguments(x), op)
             return 1
         else
             # Handles +, *
-            nested && length(arguments(x))-1 + count_operation(arguments(x), op)
-            return length(arguments(x))-1
+            nested && length(arguments(x)) - 1 + count_operation(arguments(x), op)
+            return length(arguments(x)) - 1
         end
     elseif nested
         return count_operation(arguments(x), op, nested)
@@ -51,34 +28,39 @@ function count_operation(x, op::Function, nested::Bool = true)
     return 0
 end
 
+function count_operation(x::Num, op::Function, nested::Bool = true)
+    return count_operation(value(x), op, nested)
+end
+
 function count_operation(x, ops::AbstractArray, nested::Bool = true)
     return sum([count_operation(x, op, nested) for op in ops])
 end
 
 function count_operation(x::AbstractArray, op::Function, nested::Bool = true)
-    sum([count_operation(xi, op, nested) for xi in x])
+    return sum([count_operation(xi, op, nested) for xi in x])
 end
 
 function count_operation(x::AbstractArray, ops::AbstractArray, nested::Bool = true)
     counter = 0
     @inbounds for xi in x, op in ops
+
         counter += count_operation(xi, op, nested)
     end
-    counter
+    return counter
 end
 
 function split_term!(x::AbstractArray, o, ops::AbstractArray = [+])
-    if istree(o)
+    if iscall(o)
         n_ops = count_operation(o, ops, false)
         c_ops = 0
         @views begin
             if n_ops == 0
-                x[begin]= o
+                x[begin] = o
             else
                 counter_ = 1
                 for oi in arguments(o)
                     c_ops = count_operation(oi, ops, false)
-                    split_term!(x[counter_:counter_+c_ops], oi, ops)
+                    split_term!(x[counter_:(counter_ + c_ops)], oi, ops)
                     counter_ += c_ops + 1
                 end
             end
@@ -89,20 +71,23 @@ function split_term!(x::AbstractArray, o, ops::AbstractArray = [+])
     return
 end
 
-split_term!(x::AbstractArray,o::Num, ops::AbstractArray = [+]) = split_term!(x, value(o), ops)
+function split_term!(x::AbstractArray, o::Num, ops::AbstractArray = [+])
+    return split_term!(x, value(o), ops)
+end
 
 remove_constant_factor(x::Num) = remove_constant_factor(value(x))
 remove_constant_factor(x::Number) = one(x)
 
 function remove_constant_factor(x)
     # Return, if the function is nested
-    istree(x) || return x
+    iscall(x) || return x
     # Count the number of operations
-    n_ops = count_operation(x, [*], false)+1
+    n_ops = count_operation(x, [*], false) + 1
     # Create a new array
     ops = Array{Any}(undef, n_ops)
     @views split_term!(ops, x, [*])
-    filter!(x->!isa(x, Number), ops)
+    # Filter out constants (both Number and SymbolicUtils Const types)
+    filter!(x -> !_is_constant(x), ops)
     return Num(prod(ops))
 end
 
@@ -122,12 +107,70 @@ function create_linear_independent_eqs(ops::AbstractVector, simplify_eqs::Bool =
     u_o = Array{Any}(undef, n_x)
     ind_lo, ind_up = 0, 0
     for i in eachindex(o)
-        ind_lo = i > 1 ? sum(n_ops[1:i-1]) + i : 1
+        ind_lo = i > 1 ? sum(n_ops[1:(i - 1)]) + i : 1
         ind_up = sum(n_ops[1:i]) + i
 
         @views split_term!(u_o[ind_lo:ind_up], o[i], [+])
     end
     u_o = remove_constant_factor(u_o)
-    unique!(u_o)
+    _unique_symbolics!(u_o)
     return simplify_eqs ? simplify.(Num.(u_o)) : Num.(u_o)
+end
+
+function is_dependent(x::SymbolicUtils.BasicSymbolic, y::SymbolicUtils.BasicSymbolic)
+    # In SymbolicUtils v4, occursin was removed. Use get_variables instead.
+    # Check if y appears in the variables of x
+    vars = Symbolics.get_variables(x)
+    return y in vars
+end
+
+function is_dependent(x::Any, y::SymbolicUtils.BasicSymbolic)
+    return false
+end
+
+function is_dependent(x::SymbolicUtils.BasicSymbolic, y::Any)
+    return false
+end
+
+function is_dependent(x::Num, y::Num)
+    return is_dependent(y.val, x.val)
+end
+
+function is_dependent(x::Num, y::AbstractVector{Num})
+    return map(yi -> is_dependent(x, yi), y)
+end
+
+function is_dependent(x::AbstractVector{Num}, y::AbstractVector{Num})
+    inds = reduce(hcat, map(xi -> is_dependent(xi, y), x))
+    return inds = reshape(inds, length(y), length(x))
+end
+
+is_not_dependent(x, y) = .!is_dependent(x, y)
+
+function is_unary(f::Function, t::Type = Number)
+    f ∈ [+, -, *, /, ^] && return false
+    for m in methods(f, (t,))
+        m.nargs - 1 > 1 && return false
+    end
+    return true
+end
+
+function is_binary(f::Function, t::Type = Number)
+    f ∈ [+, -, *, /, ^] && return true
+    return !is_unary(f, t)
+end
+
+function ariety(f::Function, t::Type = Number)
+    is_unary(f, t) && return 1
+    is_binary(f, t) && return 2
+    return 0
+end
+
+function sort_ops(f::Vector{Function})
+    U = Function[]
+    B = Function[]
+    for fi in f
+        is_unary(fi) ? push!(U, fi) : push!(B, fi)
+    end
+    return U, B
 end

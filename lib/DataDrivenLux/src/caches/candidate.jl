@@ -1,0 +1,271 @@
+mutable struct PathStatistics{T} <: StatisticalModel
+    rss::T
+    loglikelihood::T
+    nullloglikelihood::T
+    dof::Int
+    nobs::Int
+end
+
+function update_stats!(
+        stats::PathStatistics{T}, rss::T, ll::T, nullll::T, dof::Int
+    ) where {T}
+    stats.dof = dof
+    stats.loglikelihood = ll
+    stats.nullloglikelihood = nullll
+    stats.rss = rss
+    return
+end
+
+StatsAPI.rss(stats::PathStatistics) = getfield(stats, :rss)
+StatsAPI.nobs(stats::PathStatistics) = getfield(stats, :nobs)
+StatsAPI.loglikelihood(stats::PathStatistics) = getfield(stats, :loglikelihood)
+StatsAPI.nullloglikelihood(stats::PathStatistics) = getfield(stats, :nullloglikelihood)
+StatsAPI.dof(stats::PathStatistics) = getfield(stats, :dof)
+StatsAPI.r2(c::PathStatistics) = r2(c, :CoxSnell)
+
+@concrete struct ComponentModel
+    basis
+    model
+end
+
+function (c::ComponentModel)(
+        dataset::Dataset{T}, ps, st::NamedTuple,
+        p::AbstractVector{T}
+    ) where {T}
+    return first(c.model(c.basis(dataset, p), ps, st))
+end
+function (c::ComponentModel)(ps, st::NamedTuple, paths::Vector{<:AbstractPathState})
+    return get_loglikelihood(c.model, ps, st, paths)
+end
+
+"""
+$(TYPEDEF)
+
+A container holding all the information for the current candidate solution
+to the symbolic regression problem.
+
+# Fields
+
+$(FIELDS)
+
+# Arguments
+
+- `rng`: random-number generator replicated for this candidate.
+- `model`: callable graph model.
+- `basis`: feature basis used to evaluate the dataset.
+- `dataset::Dataset`: observed data and interval bounds.
+
+# Keywords
+
+- `observed::ObservedModel`: observation likelihood model.
+- `parameterdist`: distribution and transform for basis parameters.
+- `ptype`: element type used for candidate state and parameters.
+
+# Returns
+
+Return a candidate with initialized Lux parameters, path state, scales, and
+statistical fit values.
+"""
+@concrete struct Candidate <: StatisticalModel
+    "Random seed"
+    rng
+    "The current state"
+    st
+    "The current parameters"
+    ps
+    "Incoming paths"
+    incoming_path
+    "Outgoing path"
+    outgoing_path
+    "Statistics"
+    statistics
+    "The observed model"
+    observed
+    "The parameter distribution"
+    parameterdist
+    "The optimal scales"
+    scales
+    "The optimal parameters"
+    parameters
+    "The component model"
+    model
+end
+
+function (c::Candidate)(dataset::Dataset{T}, ps = c.ps, p = c.parameters) where {T}
+    return c.model(dataset, ps, c.st, transform_parameter(c.parameterdist, p))
+end
+(c::Candidate)(ps = c.ps) = c.model(ps, c.st, c.outgoing_path)
+
+Base.print(io::IO, c::Candidate) = print(io, "Candidate $(rss(c))")
+Base.show(io::IO, c::Candidate) = print(io, c)
+Base.summary(io::IO, c::Candidate) = print(io, c)
+
+StatsAPI.rss(c::Candidate) = rss(c.statistics)
+StatsAPI.nobs(c::Candidate) = nobs(c.statistics)
+StatsAPI.loglikelihood(c::Candidate) = loglikelihood(c.statistics)
+StatsAPI.nullloglikelihood(c::Candidate) = nullloglikelihood(c.statistics)
+StatsAPI.dof(c::Candidate) = dof(c.statistics)
+StatsAPI.r2(c::Candidate) = r2(c, :CoxSnell)
+
+get_parameters(c::Candidate) = transform_parameter(c.parameterdist, c.parameters)
+get_scales(c::Candidate) = transform_scales(c.observed, c.scales)
+
+function Candidate(
+        rng, model, basis, dataset::Dataset{T}; observed = ObservedModel(dataset.y),
+        parameterdist = ParameterDistributions(basis), ptype = Float32
+    ) where {T}
+    # Create the initial state and path
+    dataset_intervals = interval_eval(basis, dataset, get_interval(parameterdist))
+
+    incoming_path = [
+        PathState{ptype}(dataset_intervals[i], (), ((0, i),))
+            for i in 1:length(basis)
+    ]
+
+    ps, st = LuxCore.setup(rng, model)
+    outgoing_path, st = sample(model, incoming_path, ps, st)
+    ps = ComponentVector(ps)
+
+    parameters = T.(get_init(parameterdist))
+    scales = T.(get_init(observed))
+
+    ŷ, _ = model(basis(dataset, transform_parameter(parameterdist, parameters)), ps, st)
+
+    lls = logpdf(observed, dataset.y, ŷ, scales)
+    lls += logpdf(parameterdist, parameters)
+
+    rss = sum(abs2, dataset.y .- ŷ)
+    dof_ = get_dof(outgoing_path)
+
+    ȳ = vec(mean(dataset.y; dims = 2))
+
+    null_ll = logpdf(observed, dataset.y, ȳ, scales) + logpdf(parameterdist, parameters)
+
+    stats = PathStatistics(rss, lls, null_ll, dof_, prod(size(dataset.y)))
+
+    return Candidate(
+        LuxCore.replicate(rng), st, ComponentVector(ps), incoming_path,
+        outgoing_path, stats, observed, parameterdist, scales, parameters,
+        ComponentModel(basis, model)
+    )
+end
+
+function update_values!(c::Candidate, ps, dataset)
+    (; observed, st, scales, statistics, parameters, parameterdist, outgoing_path) = c
+    (; y) = dataset
+
+    ŷ = c(dataset, ps, parameters)
+
+    dataloglikelihood = logpdf(observed, y, ŷ, scales) + logpdf(parameterdist, parameters)
+    rss = sum(abs2, y .- ŷ)
+    dof = get_dof(outgoing_path)
+    ȳ = vec(mean(y; dims = 2))
+    nullloglikelihood = logpdf(observed, y, ȳ, scales) + logpdf(parameterdist, parameters)
+    update_stats!(statistics, rss, dataloglikelihood, nullloglikelihood, dof)
+    return
+end
+
+@views function Distributions.logpdf(
+        c::Candidate, p::ComponentVector, dataset::Dataset{T}, ps = c.ps
+    ) where {T}
+    ŷ = c(dataset, ps, p.parameters)
+    return logpdf(c, p, dataset.y, ŷ)
+end
+
+function Distributions.logpdf(
+        c::Candidate, p::AbstractVector, y::AbstractMatrix{T},
+        ŷ::AbstractMatrix{T}
+    ) where {T}
+    return logpdf(c.observed, y, ŷ, p.scales) + logpdf(c.parameterdist, p.parameters)
+end
+
+initial_values(c::Candidate) = ComponentVector(; c.scales, c.parameters)
+
+function _optim_converged(result)
+    status = result.stopped_by
+    convergence_reached = status.x_converged || status.f_converged || status.g_converged
+    x_isfinite = isfinite(result.x_abschange) || isnan(result.x_relchange)
+    f_isfinite = if status.iterations > 0
+        isfinite(result.f_abschange) || isnan(result.f_relchange)
+    else
+        true
+    end
+    g_isfinite = isfinite(result.g_residual)
+    return convergence_reached && all((x_isfinite, f_isfinite, g_isfinite))
+end
+
+function optimize_candidate!(
+        c::Candidate, dataset::Dataset{T}, ps = c.ps; optimizer = Optim.LBFGS(),
+        options = nothing
+    ) where {T}
+    path, st = sample(c, ps)
+    p_init = initial_values(c)
+
+    if all(IntervalArithmetic.iscommon, map(get_interval, c.outgoing_path))
+        if any(needs_optimization, (c.observed, c.parameterdist))
+            loss(p) = -logpdf(c, p, dataset)
+            # We do not want any warnings here
+            res = with_logger(NullLogger()) do
+                if isnothing(options)
+                    return Optim.optimize(loss, p_init, optimizer)
+                end
+                return Optim.optimize(loss, p_init, optimizer, options)
+            end
+
+            if _optim_converged(res)
+                c.outgoing_path .= path
+                @set! c.st = st
+                c.parameters .= res.minimizer.parameters
+                c.scales .= res.minimizer.scales
+                update_values!(c, ps, dataset)
+                return
+            end
+        else
+            update_values!(c, ps, dataset)
+        end
+    end
+
+    return
+end
+
+check_intervals(paths::AbstractArray{<:AbstractPathState}) = all(check_intervals, paths)
+
+function sample(c::Candidate, ps, i = 0, max_sample = 10)
+    return sample(c.model.model, c.incoming_path, ps, c.st, i, max_sample)
+end
+
+function sample(model, incoming, ps, st, i = 0, max_sample = 10)
+    outgoing, new_st = model(incoming, ps, st)
+    if check_intervals(outgoing) || (i >= max_sample)
+        return outgoing, new_st
+    end
+    return sample(model, incoming, ps, st, i + 1, max_sample)
+end
+
+get_nodes(c::Candidate) = @ignore_derivatives get_nodes(c.outgoing_path)
+
+function convert_to_basis(
+        candidate::Candidate, ps = candidate.ps, options = DataDrivenCommonOptions()
+    )
+    (; basis, model) = candidate.model
+    (; eval_expresssion) = options
+    p_best = get_parameters(candidate)
+
+    p_new = map(enumerate(parameters(basis))) do (i, ps)
+        return Num(setdefault(ps, p_best[i]))
+    end
+
+    subs = Dict(a => b for (a, b) in zip(parameters(basis), p_new))
+
+    rhs = map(x -> Num(x.rhs), equations(basis))
+    eqs, _ = model(rhs, ps, candidate.st)
+
+    eqs = collect(map(eq -> substitute(eq, subs), eqs))
+
+    return Basis(
+        eqs, states(basis), parameters = p_new, iv = get_iv(basis),
+        controls = DataDrivenDiffEq.controls(basis), observed = observed(basis),
+        implicits = implicit_variables(basis),
+        name = gensym(:Basis), eval_expression = eval_expresssion
+    )
+end

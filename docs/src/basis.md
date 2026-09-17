@@ -2,6 +2,21 @@
 
 ```@docs
 Basis
+Difference
+```
+
+## API
+
+Next to [ModelingToolkit's API](https://docs.sciml.ai/ModelingToolkit/stable/basics/AbstractSystem/) for `AbstractSystems`, a [`Basis`](@ref) can be called with the following methods:
+
+```@docs
+dynamics
+jacobian
+implicit_variables
+states
+controls
+get_parameter_values
+get_parameter_map
 ```
 
 ## Generators
